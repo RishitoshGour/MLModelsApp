@@ -7,6 +7,7 @@ Run this file to set up and launch the application
 import subprocess
 import sys
 import os
+import app
 
 def check_and_install_packages():
     """Check if required packages are installed and install if necessary"""

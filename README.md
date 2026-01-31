@@ -198,3 +198,7 @@ Feel free to extend this application by:
 ## License
 
 This project is open source and free to use for educational purposes.
+
+## Application
+
+This application is defined in `app.py`.
