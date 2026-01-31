@@ -60,7 +60,16 @@ st.sidebar.header("⚙️ Configuration")
 
 # Dataset Selection
 st.sidebar.subheader("Dataset Selection")
-st.sidebar.info("Using Breast Cancer Dataset")
+dataset_option = st.sidebar.radio(
+    "Choose dataset source:",
+    ["Default (Breast Cancer)", "Upload CSV"]
+)
+
+# File upload for CSV
+if dataset_option == "Upload CSV":
+    uploaded_file = st.sidebar.file_uploader("Choose a CSV file", type="csv")
+else:
+    uploaded_file = None
 
 # Model Selection
 st.sidebar.subheader("Model Selection")
@@ -87,7 +96,7 @@ random_state = st.sidebar.slider("Random State:", 1, 100, 42)
 # Load and Prepare Data
 # =====================
 @st.cache_data
-def load_data():
+def load_default_data():
     # Download Breast Cancer dataset directly from OpenML
     data = fetch_openml(
         name='breast-cancer',
@@ -117,8 +126,65 @@ def load_data():
     
     return X, y, feature_names, target_names
 
-# Load dataset
-X, y, feature_names, target_names = load_data()
+def load_custom_csv(uploaded_file):
+    """Load data from uploaded CSV file"""
+    try:
+        df = pd.read_csv(uploaded_file)
+        
+        # Ask user to select target column
+        st.sidebar.subheader("CSV Configuration")
+        target_col = st.sidebar.selectbox(
+            "Select target column (last column by default):",
+            df.columns,
+            index=len(df.columns) - 1
+        )
+        
+        if target_col not in df.columns:
+            st.error(f"Target column '{target_col}' not found in CSV")
+            return None
+        
+        y = df[target_col].values
+        X_df = df.drop(columns=[target_col])
+        
+        # Encode categorical features and target
+        X_df = X_df.copy()
+        target_names = np.unique(y)
+        
+        # Encode target labels if they are strings
+        le_target = LabelEncoder()
+        if y.dtype == 'object':
+            y = le_target.fit_transform(y)
+            target_names = le_target.classes_.tolist()
+        else:
+            target_names = [str(int(i)) for i in np.unique(y)]
+        
+        # Encode all categorical features to numeric
+        for col in X_df.columns:
+            if X_df[col].dtype == 'object':
+                le = LabelEncoder()
+                X_df[col] = le.fit_transform(X_df[col].astype(str))
+        
+        X = X_df.values
+        feature_names = X_df.columns.tolist()
+        
+        return X, y, feature_names, target_names
+    
+    except Exception as e:
+        st.error(f"Error loading CSV file: {e}")
+        return None
+
+# Load dataset based on selection
+if dataset_option == "Upload CSV":
+    if uploaded_file is not None:
+        data_result = load_custom_csv(uploaded_file)
+        if data_result is None:
+            st.stop()
+        X, y, feature_names, target_names = data_result
+    else:
+        st.sidebar.warning("Please upload a CSV file to continue.")
+        st.stop()
+else:
+    X, y, feature_names, target_names = load_default_data()
 
 # Split the data
 X_train, X_test, y_train, y_test = train_test_split(
@@ -162,7 +228,8 @@ with tab1:
     col1, col2 = st.columns(2)
     
     with col1:
-        st.write(f"**Dataset Name:** Breast Cancer")
+        dataset_name = "Breast Cancer (OpenML)" if dataset_option == "Default (Breast Cancer)" else uploaded_file.name
+        st.write(f"**Dataset Name:** {dataset_name}")
         st.write(f"**Total Samples:** {len(X)}")
         st.write(f"**Number of Features:** {X.shape[1]}")
         st.write(f"**Number of Classes:** {len(np.unique(y))}")
