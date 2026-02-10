@@ -14,11 +14,11 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (
     confusion_matrix, classification_report, accuracy_score,
     precision_score, recall_score, f1_score, roc_auc_score,
-    roc_curve, auc
+    roc_curve, auc, matthews_corrcoef
 )
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.svm import SVC
+from xgboost import XGBClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.naive_bayes import GaussianNB
 from sklearn.tree import DecisionTreeClassifier
@@ -46,7 +46,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # Title and Description
-st.title("🤖 Interactive Classification Models Demonstration")
+st.title("🤖 Classification Models")
 st.markdown("""
     This application demonstrates various classification algorithms with interactive
     features. You can select different datasets, models, and hyperparameters to explore
@@ -68,8 +68,62 @@ dataset_option = st.sidebar.radio(
 # File upload for CSV
 if dataset_option == "Upload CSV":
     uploaded_file = st.sidebar.file_uploader("Choose a CSV file", type="csv")
+    
+    # Force target column selection if file is uploaded
+    target_col = None
+    if uploaded_file is not None:
+        st.sidebar.subheader("CSV Configuration")
+        
+        # Load CSV temporarily to get column names
+        try:
+            from io import StringIO, BytesIO
+            
+            # Read bytes and reset position
+            file_bytes = uploaded_file.getbuffer().tobytes()
+            
+            # Decode and clean content
+            content = file_bytes.decode('utf-8')
+            lines = content.split('\n')
+            cleaned_lines = []
+            for i, line in enumerate(lines):
+                line = line.rstrip()
+                if line.endswith(','):
+                    line = line[:-1]
+                if line.strip():  # Only keep non-empty lines
+                    cleaned_lines.append(line)
+            
+            if not cleaned_lines:
+                st.sidebar.error("❌ CSV file is empty or contains no valid data")
+            else:
+                cleaned_content = '\n'.join(cleaned_lines)
+                
+                # Try to read CSV
+                try:
+                    df_temp = pd.read_csv(StringIO(cleaned_content))
+                    
+                    if len(df_temp.columns) == 0:
+                        st.sidebar.error("❌ CSV has no columns")
+                    else:
+                        # Force user to select target column
+                        target_col = st.sidebar.selectbox(
+                            "Select target column (REQUIRED):",
+                            df_temp.columns,
+                            index=len(df_temp.columns) - 1,
+                            key="target_column_selector"
+                        )
+                        st.sidebar.success(f"✓ CSV loaded: {len(df_temp)} rows, {len(df_temp.columns)} columns")
+                except pd.errors.ParserError as pe:
+                    st.sidebar.error(f"❌ CSV parsing error: {str(pe)}")
+                except Exception as e:
+                    st.sidebar.error(f"❌ Error reading CSV: {str(e)}")
+                    
+        except UnicodeDecodeError:
+            st.sidebar.error("❌ File encoding error. Please ensure the CSV is UTF-8 encoded.")
+        except Exception as e:
+            st.sidebar.error(f"❌ Error processing CSV: {str(e)}")
 else:
     uploaded_file = None
+    target_col = None
 
 # Model Selection
 st.sidebar.subheader("Model Selection")
@@ -80,7 +134,7 @@ selected_models = st.sidebar.multiselect(
         "Decision Tree",
         "Random Forest",
         "Gradient Boosting",
-        "Support Vector Machine (SVM)",
+        "XGBoost",
         "K-Nearest Neighbors",
         "Naive Bayes"
     ],
@@ -126,69 +180,149 @@ def load_default_data():
     
     return X, y, feature_names, target_names
 
-def load_custom_csv(uploaded_file):
+def load_custom_csv(uploaded_file, target_col):
     """Load data from uploaded CSV file"""
     try:
-        df = pd.read_csv(uploaded_file)
+        from io import StringIO
         
-        # Ask user to select target column
-        st.sidebar.subheader("CSV Configuration")
-        target_col = st.sidebar.selectbox(
-            "Select target column (last column by default):",
-            df.columns,
-            index=len(df.columns) - 1
-        )
+        # Read bytes to avoid file pointer issues
+        file_bytes = uploaded_file.getbuffer().tobytes()
+        content = file_bytes.decode('utf-8')
         
-        if target_col not in df.columns:
-            st.error(f"Target column '{target_col}' not found in CSV")
+        # Fix CSV format issues - Remove trailing commas from ALL lines
+        lines = content.split('\n')
+        cleaned_lines = []
+        
+        for i, line in enumerate(lines):
+            # Remove trailing commas and whitespace
+            line = line.rstrip()  # Remove trailing whitespace
+            if line.endswith(','):
+                line = line[:-1]  # Remove trailing comma
+            if line.strip():  # Only keep non-empty lines
+                cleaned_lines.append(line)
+        
+        if not cleaned_lines:
+            st.error("❌ CSV file is empty or contains no valid data")
             return None
         
-        y = df[target_col].values
-        X_df = df.drop(columns=[target_col])
+        cleaned_content = '\n'.join(cleaned_lines)
         
-        # Encode categorical features and target
-        X_df = X_df.copy()
-        target_names = np.unique(y)
+        # Parse the cleaned CSV
+        try:
+            df = pd.read_csv(StringIO(cleaned_content))
+        except pd.errors.ParserError as pe:
+            st.error(f"❌ CSV parsing error: {str(pe)}")
+            return None
         
-        # Encode target labels if they are strings
-        le_target = LabelEncoder()
-        if y.dtype == 'object':
-            y = le_target.fit_transform(y)
-            target_names = le_target.classes_.tolist()
-        else:
-            target_names = [str(int(i)) for i in np.unique(y)]
+        if len(df.columns) == 0:
+            st.error("❌ CSV has no columns to parse")
+            return None
         
-        # Encode all categorical features to numeric
+        st.success(f"✓ CSV loaded with {len(df)} rows and {len(df.columns)} columns")
+        
+        if target_col not in df.columns:
+            st.error(f"❌ Target column '{target_col}' not found in CSV")
+            return None
+        
+        # Separate target and features
+        y = df[target_col].dropna().values
+        
+        if len(y) == 0:
+            st.error("❌ Target column is empty")
+            return None
+        
+        # Get all other columns
+        other_cols = [col for col in df.columns if col != target_col]
+        
+        # Try to identify numeric features
+        # Skip ID-like columns (all unique values, usually integers with large numbers)
+        numeric_features = []
+        for col in other_cols:
+            try:
+                # Try to convert to numeric
+                numeric_vals = pd.to_numeric(df[col], errors='coerce')
+                
+                # Check if most values are numeric (>90% successful conversion)
+                conversion_rate = numeric_vals.notna().sum() / len(df)
+                
+                # Skip if it looks like an ID column (all unique or mostly unique)
+                uniqueness = df[col].nunique() / len(df)
+                is_id_like = uniqueness > 0.9 and col.lower() in ['id', 'patient_id', 'sample_id', 'index']
+                
+                if conversion_rate > 0.9 and not is_id_like:
+                    numeric_features.append(col)
+            except:
+                pass
+        
+        if not numeric_features:
+            st.error("❌ No numeric feature columns found")
+            st.write(f"Available columns: {other_cols}")
+            return None
+        
+        st.success(f"✓ Found {len(numeric_features)} numeric features")
+        
+        # Select rows with valid target
+        valid_target_idx = df[target_col].notna()
+        
+        X_df = df.loc[valid_target_idx, numeric_features].copy()
+        y = df.loc[valid_target_idx, target_col].values
+        
+        # Convert to numeric
         for col in X_df.columns:
-            if X_df[col].dtype == 'object':
-                le = LabelEncoder()
-                X_df[col] = le.fit_transform(X_df[col].astype(str))
+            X_df[col] = pd.to_numeric(X_df[col], errors='coerce')
         
-        X = X_df.values
-        feature_names = X_df.columns.tolist()
+        # Remove rows with any missing values
+        X_df = X_df.dropna()
+        y = y[:len(X_df)]
         
-        return X, y, feature_names, target_names
+        if len(X_df) == 0:
+            st.error("❌ No valid data rows found after cleaning")
+            return None
+        
+        st.success(f"✓ Loaded {len(X_df)} valid samples with {len(numeric_features)} numeric features")
+        
+        # Encode target
+        le_target = LabelEncoder()
+        y_encoded = le_target.fit_transform(y.astype(str))
+        target_names = le_target.classes_.tolist()
+        
+        st.info(f"✓ Target classes: {target_names}")
+        
+        X = X_df.values.astype(float)
+        feature_names = numeric_features
+        
+        return X, y_encoded, feature_names, target_names
     
+    except UnicodeDecodeError:
+        st.error("❌ File encoding error. Please ensure the CSV is UTF-8 encoded.")
+        return None
+    except pd.errors.ParserError as pe:
+        st.error(f"❌ CSV parsing error: {str(pe)}")
+        return None
     except Exception as e:
-        st.error(f"Error loading CSV file: {e}")
+        st.error(f"❌ Error loading CSV: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
         return None
 
 # Load dataset based on selection
 if dataset_option == "Upload CSV":
     if uploaded_file is not None:
-        data_result = load_custom_csv(uploaded_file)
+        if target_col is None:
+            st.error("⚠️ Please select a target column from the sidebar to continue.")
+            st.stop()
+        data_result = load_custom_csv(uploaded_file, target_col)
         if data_result is None:
             st.stop()
         X, y, feature_names, target_names = data_result
     else:
-        st.sidebar.warning("Please upload a CSV file to continue.")
+        st.error("⚠️ Please upload a CSV file to continue.")
         st.stop()
 else:
     X, y, feature_names, target_names = load_default_data()
-
-# Split the data
+ 
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=test_size, random_state=random_state, stratify=y
+        X, y, test_size=test_size, random_state=random_state
 )
 
 # Standardize features
@@ -265,7 +399,7 @@ with tab2:
             "Decision Tree": DecisionTreeClassifier(random_state=random_state),
             "Random Forest": RandomForestClassifier(n_estimators=100, random_state=random_state),
             "Gradient Boosting": GradientBoostingClassifier(n_estimators=100, random_state=random_state),
-            "Support Vector Machine (SVM)": SVC(probability=True, random_state=random_state),
+            "XGBoost": XGBClassifier(n_estimators=100, random_state=random_state, verbosity=0),
             "K-Nearest Neighbors": KNeighborsClassifier(n_neighbors=5),
             "Naive Bayes": GaussianNB()
         }
@@ -290,12 +424,14 @@ with tab2:
             prec = precision_score(y_test, y_pred, average='weighted', zero_division=0)
             rec = recall_score(y_test, y_pred, average='weighted', zero_division=0)
             f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+            mcc = matthews_corrcoef(y_test, y_pred)
             
             results[model_name] = {
                 'Accuracy': acc,
                 'Precision': prec,
                 'Recall': rec,
                 'F1-Score': f1,
+                'MCC Score': mcc,
                 'Predictions': y_pred,
                 'Probabilities': y_pred_proba
             }
@@ -306,7 +442,8 @@ with tab2:
                 'Accuracy': f"{results[model]['Accuracy']:.4f}",
                 'Precision': f"{results[model]['Precision']:.4f}",
                 'Recall': f"{results[model]['Recall']:.4f}",
-                'F1-Score': f"{results[model]['F1-Score']:.4f}"
+                'F1-Score': f"{results[model]['F1-Score']:.4f}",
+                'MCC Score': f"{results[model]['MCC Score']:.4f}"
             }
             for model in selected_models
         }).T
@@ -364,7 +501,7 @@ with tab3:
             "Decision Tree": DecisionTreeClassifier(random_state=random_state),
             "Random Forest": RandomForestClassifier(n_estimators=100, random_state=random_state),
             "Gradient Boosting": GradientBoostingClassifier(n_estimators=100, random_state=random_state),
-            "Support Vector Machine (SVM)": SVC(probability=True, random_state=random_state),
+            "XGBoost": XGBClassifier(n_estimators=100, random_state=random_state, verbosity=0),
             "K-Nearest Neighbors": KNeighborsClassifier(n_neighbors=5),
             "Naive Bayes": GaussianNB()
         }
@@ -450,7 +587,7 @@ with tab4:
             "Decision Tree": DecisionTreeClassifier(random_state=random_state),
             "Random Forest": RandomForestClassifier(n_estimators=100, random_state=random_state),
             "Gradient Boosting": GradientBoostingClassifier(n_estimators=100, random_state=random_state),
-            "Support Vector Machine (SVM)": SVC(probability=True, random_state=random_state),
+            "XGBoost": XGBClassifier(n_estimators=100, random_state=random_state, verbosity=0),
             "K-Nearest Neighbors": KNeighborsClassifier(n_neighbors=5),
             "Naive Bayes": GaussianNB()
         }
@@ -492,10 +629,3 @@ with tab4:
                 ax.text(0.5, i, pred, ha='center', va='center', fontweight='bold', color='white')
             st.pyplot(fig)
 
-# =====================
-# Footer
-# =====================
-st.markdown("""
-    ---
-    **Built with Streamlit** | Classification Models Demonstration
-    """)
